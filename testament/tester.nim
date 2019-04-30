@@ -12,9 +12,18 @@
 import
   parseutils, strutils, pegs, os, osproc, streams, parsecfg, json,
   marshal, backend, parseopt, specs, htmlgen, browsers, terminal,
-  algorithm, compiler/nodejs, times, sets, md5
+  algorithm, times, sets, md5, sequtils
+
+include compiler/nodejs
+
+var useColors = true
+var backendLogging = true
+var simulate = false
+var verboseMegatest = false # very verbose but can be useful
+var verboseCommands = false
 
 const
+  testsDir = "tests" & DirSep
   resultsFile = "testresults.html"
   #jsonFile = "testresults.json" # not used
   Usage = """Usage:
@@ -25,13 +34,21 @@ Command:
   c|cat|category <category>   run all the tests of a certain category
   r|run <test>                run single test file
   html                        generate $1 from the database
+  stats                       generate statistics about test cases
 Arguments:
   arguments are passed to the compiler
 Options:
   --print                   also print results to the console
+  --verboseMegatest         log to stdout megatetest compilation
+  --verboseCommands         log to stdout info about commands being run
+  --simulate                see what tests would be run but don't run them (for debugging)
   --failing                 only show failing/ignored tests
   --targets:"c c++ js objc" run tests for specified targets (default: all)
-  --nim:path                use a particular nim executable (default: compiler/nim)
+  --nim:path                use a particular nim executable (default: $$PATH/nim)
+  --directory:dir           Change to directory dir before reading the tests or doing anything else.
+  --colors:on|off           Turn messagescoloring on|off.
+  --backendLogging:on|off   Disable or enable backend logging. By default turned on.
+  --skipFrom:file           Read tests to skip from `file` - one test per line, # comments ignored
 """ % resultsFile
 
 type
@@ -45,6 +62,8 @@ type
     cat: Category
     options: string
     action: TTestAction
+    args: seq[string]
+    spec: TSpec
     startTime: float
 
 # ----------------------------------------------------------------------------
@@ -53,12 +72,15 @@ let
   pegLineError =
     peg"{[^(]*} '(' {\d+} ', ' {\d+} ') ' ('Error') ':' \s* {.*}"
   pegLineTemplate =
-    peg"{[^(]*} '(' {\d+} ', ' {\d+} ') ' 'template/generic instantiation from here'.*"
+    peg"""
+      {[^(]*} '(' {\d+} ', ' {\d+} ') '
+      'template/generic instantiation' ( ' of `' [^`]+ '`' )? ' from here' .*
+    """
   pegOtherError = peg"'Error:' \s* {.*}"
   pegSuccess = peg"'Hint: operation successful'.*"
   pegOfInterest = pegLineError / pegOtherError
 
-var targets = {low(TTarget)..high(TTarget)}
+var gTargets = {low(TTarget)..high(TTarget)}
 
 proc normalizeMsg(s: string): string =
   result = newStringOfCap(s.len+1)
@@ -71,19 +93,57 @@ proc getFileDir(filename: string): string =
   if not result.isAbsolute():
     result = getCurrentDir() / result
 
+proc execCmdEx2(command: string, args: openarray[string], options: set[ProcessOption], input: string, onStdout: proc(line: string) = nil): tuple[
+                output: TaintedString,
+                exitCode: int] {.tags:
+                [ExecIOEffect, ReadIOEffect, RootEffect], gcsafe.} =
+  var p = startProcess(command, args=args, options=options)
+  var outp = outputStream(p)
+
+  # There is no way to provide input for the child process
+  # anymore. Closing it will create EOF on stdin instead of eternal
+  # blocking.
+  let instream = inputStream(p)
+  instream.write(input)
+  close instream
+
+  result = (TaintedString"", -1)
+  var line = newStringOfCap(120).TaintedString
+  while true:
+    if outp.readLine(line):
+      result.output.string.add(line.string)
+      result.output.string.add("\n")
+      if onStdout != nil: onStdout(line.string)
+    else:
+      result.exitCode = peekExitCode(p)
+      if result.exitCode != -1: break
+  close(p)
+
+  if verboseCommands:
+    var command2 = command
+    if args.len > 0: command2.add " " & args.quoteShellCommand
+    echo (msg: "execCmdEx2",
+      command: command2,
+      options: options,
+      exitCode: result.exitCode)
+
 proc nimcacheDir(filename, options: string, target: TTarget): string =
   ## Give each test a private nimcache dir so they don't clobber each other's.
   let hashInput = options & $target
   return "nimcache" / (filename & '_' & hashInput.getMD5)
 
+proc prepareTestArgs(cmdTemplate, filename, options: string,
+                     target: TTarget, extraOptions=""): seq[string] =
+  let nimcache = nimcacheDir(filename, options, target)
+  let options = options & " " & quoteShell("--nimCache:" & nimcache) & extraOptions
+  return parseCmdLine(cmdTemplate % ["target", targetToCmd[target],
+                      "options", options, "file", filename.quoteShell,
+                      "filedir", filename.getFileDir()])
+
 proc callCompiler(cmdTemplate, filename, options: string,
                   target: TTarget, extraOptions=""): TSpec =
-  let nimcache = nimcacheDir(filename, options, target)
-  let options = options & " " & ("--nimCache:" & nimcache).quoteShell & extraOptions
-  let c = parseCmdLine(cmdTemplate % ["target", targetToCmd[target],
-                       "options", options, "file", filename.quoteShell,
-                       "filedir", filename.getFileDir()])
-  var p = startProcess(command=c[0], args=c[1.. ^1],
+  let c = prepareTestArgs(cmdTemplate, filename, options, target, extraOptions)
+  var p = startProcess(command=c[0], args=c[1 .. ^1],
                        options={poStdErrToStdOut, poUsePath})
   let outp = p.outputStream
   var suc = ""
@@ -150,11 +210,30 @@ proc initResults: TResults =
   result.skipped = 0
   result.data = ""
 
-#proc readResults(filename: string): TResults = # not used
-#  result = marshal.to[TResults](readFile(filename).string)
+import macros
 
-#proc writeResults(filename: string, r: TResults) = # not used
-#  writeFile(filename, $$r)
+macro ignoreStyleEcho(args: varargs[typed]): untyped =
+  let typForegroundColor = bindSym"ForegroundColor".getType
+  let typBackgroundColor = bindSym"BackgroundColor".getType
+  let typStyle = bindSym"Style".getType
+  let typTerminalCmd = bindSym"TerminalCmd".getType
+  result = newCall(bindSym"echo")
+  for arg in children(args):
+    if arg.kind == nnkNilLit: continue
+    let typ = arg.getType
+    if typ.kind != nnkEnumTy or
+       typ != typForegroundColor and
+       typ != typBackgroundColor and
+       typ != typStyle and
+       typ != typTerminalCmd:
+      result.add(arg)
+
+template maybeStyledEcho(args: varargs[untyped]): untyped =
+  if useColors:
+    styledEcho(args)
+  else:
+    ignoreStyleEcho(args)
+
 
 proc `$`(x: TResults): string =
   result = ("Tests passed: $1 / $3 <br />\n" &
@@ -163,31 +242,36 @@ proc `$`(x: TResults): string =
 
 proc addResult(r: var TResults, test: TTest, target: TTarget,
                expected, given: string, success: TResultEnum) =
-  let name = test.name.extractFilename & " " & $target & test.options
+  # test.name is easier to find than test.name.extractFilename
+  # A bit hacky but simple and works with tests/testament/tshouldfail.nim
+  var name = test.name.replace(DirSep, '/')
+  name.add " " & $target & test.options
+
   let duration = epochTime() - test.startTime
-  let durationStr = duration.formatFloat(ffDecimal, precision = 8)
-  backend.writeTestResult(name = name,
-                          category = test.cat.string,
-                          target = $target,
-                          action = $test.action,
-                          result = $success,
-                          expected = expected,
-                          given = given)
+  let durationStr = duration.formatFloat(ffDecimal, precision = 8).align(11)
+  if backendLogging:
+    backend.writeTestResult(name = name,
+                            category = test.cat.string,
+                            target = $target,
+                            action = $test.spec.action,
+                            result = $success,
+                            expected = expected,
+                            given = given)
   r.data.addf("$#\t$#\t$#\t$#", name, expected, given, $success)
   if success == reSuccess:
-    styledEcho fgGreen, "PASS: ", fgCyan, alignLeft(name, 60), fgBlue, " (", durationStr, " secs)"
+    maybeStyledEcho fgGreen, "PASS: ", fgCyan, alignLeft(name, 60), fgBlue, " (", durationStr, " secs)"
   elif success == reIgnored:
-    styledEcho styleDim, fgYellow, "SKIP: ", styleBright, fgCyan, name
+    maybeStyledEcho styleDim, fgYellow, "SKIP: ", styleBright, fgCyan, name
   else:
-    styledEcho styleBright, fgRed, "FAIL: ", fgCyan, name
-    styledEcho styleBright, fgCyan, "Test \"", test.name, "\"", " in category \"", test.cat.string, "\""
-    styledEcho styleBright, fgRed, "Failure: ", $success
-    styledEcho fgYellow, "Expected:"
-    styledEcho styleBright, expected, "\n"
-    styledEcho fgYellow, "Gotten:"
-    styledEcho styleBright, given, "\n"
+    maybeStyledEcho styleBright, fgRed, "FAIL: ", fgCyan, name
+    maybeStyledEcho styleBright, fgCyan, "Test \"", test.name, "\"", " in category \"", test.cat.string, "\""
+    maybeStyledEcho styleBright, fgRed, "Failure: ", $success
+    maybeStyledEcho fgYellow, "Expected:"
+    maybeStyledEcho styleBright, expected, "\n"
+    maybeStyledEcho fgYellow, "Gotten:"
+    maybeStyledEcho styleBright, given, "\n"
 
-  if existsEnv("APPVEYOR"):
+  if backendLogging and existsEnv("APPVEYOR"):
     let (outcome, msg) =
       if success == reSuccess:
         ("Passed", "")
@@ -230,11 +314,13 @@ proc cmpMsgs(r: var TResults, expected, given: TSpec, test: TTest, target: TTarg
     inc(r.passed)
 
 proc generatedFile(test: TTest, target: TTarget): string =
-  let (_, name, _) = test.name.splitFile
-  let ext = targetToExt[target]
-  result = nimcacheDir(test.name, test.options, target) /
-    (if target == targetJS: "" else: "compiler_") &
-    name.changeFileExt(ext)
+  if target == targetJS:
+    result = test.name.changeFileExt("js")
+  else:
+    let (_, name, _) = test.name.splitFile
+    let ext = targetToExt[target]
+    result = nimcacheDir(test.name, test.options, target) /
+              name.replace("_", "__").changeFileExt(ext)
 
 proc needsCodegenCheck(spec: TSpec): bool =
   result = spec.maxCodeSize > 0 or spec.ccodeCheck.len > 0
@@ -265,10 +351,15 @@ proc codegenCheck(test: TTest, target: TTarget, spec: TSpec, expectedMsg: var st
     echo getCurrentExceptionMsg()
 
 proc nimoutCheck(test: TTest; expectedNimout: string; given: var TSpec) =
-  let exp = expectedNimout.strip.replace("\C\L", "\L")
-  let giv = given.nimout.strip.replace("\C\L", "\L")
-  if exp notin giv:
-    given.err = reMsgsDiffer
+  let giv = given.nimout.strip
+  var currentPos = 0
+  # Only check that nimout contains all expected lines in that order.
+  # There may be more output in nimout. It is ignored here.
+  for line in expectedNimout.strip.splitLines:
+    currentPos = giv.find(line.strip, currentPos)
+    if currentPos < 0:
+      given.err = reMsgsDiffer
+      return
 
 proc makeDeterministic(s: string): string =
   var x = splitLines(s)
@@ -292,32 +383,40 @@ proc compilerOutputTests(test: TTest, target: TTarget, given: var TSpec,
   if given.err == reSuccess: inc(r.passed)
   r.addResult(test, target, expectedmsg, givenmsg, given.err)
 
-proc testSpec(r: var TResults, test: TTest, target = targetC) =
-  let tname = test.name.addFileExt(".nim")
-  #echo "TESTING ", tname
-  var expected: TSpec
-  if test.action != actionRunNoSpec:
-    expected = parseSpec(tname)
-    if test.action == actionRun and expected.action == actionCompile:
-      expected.action = actionRun
+proc getTestSpecTarget(): TTarget =
+  if getEnv("NIM_COMPILE_TO_CPP", "false").string == "true":
+    return targetCpp
   else:
-    specDefaults expected
-    expected.action = actionRunNoSpec
+    return targetC
 
-  if expected.err == reIgnored:
-    r.addResult(test, target, "", "", reIgnored)
+proc testSpec(r: var TResults, test: TTest, targets: set[TTarget] = {}) =
+  var expected = test.spec
+  if expected.parseErrors.len > 0:
+    # targetC is a lie, but parameter is required
+    r.addResult(test, targetC, "", expected.parseErrors, reInvalidSpec)
+    inc(r.total)
+    return
+  if expected.err == reJoined:
+    # targetC is a lie, but parameter is required
+    r.addResult(test, targetC, "", "", expected.err)
     inc(r.skipped)
     inc(r.total)
     return
-
+  expected.targets.incl targets
+  # still no target specified at all
   if expected.targets == {}:
-    expected.targets.incl(target)
-
+    expected.targets = {getTestSpecTarget()}
   for target in expected.targets:
     inc(r.total)
-    if target notin targets:
+    if target notin gTargets:
       r.addResult(test, target, "", "", reIgnored)
       inc(r.skipped)
+      continue
+
+    if simulate:
+      var count {.global.} = 0
+      count.inc
+      echo "testSpec count: ", count, " expected: ", expected
       continue
 
     case expected.action
@@ -328,23 +427,15 @@ proc testSpec(r: var TResults, test: TTest, target = targetC) =
     of actionRun, actionRunNoSpec:
       # In this branch of code "early return" pattern is clearer than deep
       # nested conditionals - the empty rows in between to clarify the "danger"
-      var given = callCompiler(expected.cmd, test.name, test.options,
-                               target)
-
+      var given = callCompiler(expected.cmd, test.name, test.options, target)
       if given.err != reSuccess:
         r.addResult(test, target, "", given.msg, given.err)
         continue
-
       let isJsTarget = target == targetJS
-      var exeFile: string
-      if isJsTarget:
-        let (_, file, _) = splitFile(tname)
-        exeFile = nimcacheDir(test.name, test.options, target) / file & ".js"
-      else:
-        exeFile = changeFileExt(tname, ExeExt)
-
+      var exeFile = changeFileExt(test.name, if isJsTarget: "js" else: ExeExt)
       if not existsFile(exeFile):
-        r.addResult(test, target, expected.outp, "executable not found", reExeNotFound)
+        r.addResult(test, target, expected.outp,
+                    "executable not found: " & exeFile, reExeNotFound)
         continue
 
       let nodejs = if isJsTarget: findNodeJs() else: ""
@@ -352,10 +443,14 @@ proc testSpec(r: var TResults, test: TTest, target = targetC) =
         r.addResult(test, target, expected.outp, "nodejs binary not in PATH",
                     reExeNotFound)
         continue
-
-      let exeCmd = (if isJsTarget: nodejs & " " else: "") & exeFile
-      var (buf, exitCode) = execCmdEx(exeCmd, options = {poStdErrToStdOut})
-
+      var exeCmd: string
+      var args = test.args
+      if isJsTarget:
+        exeCmd = nodejs
+        args = concat(@[exeFile], args)
+      else:
+        exeCmd = exeFile
+      var (buf, exitCode) = execCmdEx2(exeCmd, args, options = {poStdErrToStdOut}, input = expected.input)
       # Treat all failure codes from nodejs as 1. Older versions of nodejs used
       # to return other codes, but for us it is sufficient to know that it's not 0.
       if exitCode != 0: exitCode = 1
@@ -378,22 +473,13 @@ proc testSpec(r: var TResults, test: TTest, target = targetC) =
 
       compilerOutputTests(test, target, given, expected, r)
       continue
-
     of actionReject:
       var given = callCompiler(expected.cmd, test.name, test.options,
                                target)
       cmpMsgs(r, expected, given, test, target)
       continue
 
-proc testNoSpec(r: var TResults, test: TTest, target = targetC) =
-  # does not extract the spec because the file is not supposed to have any
-  #let tname = test.name.addFileExt(".nim")
-  inc(r.total)
-  let given = callCompiler(cmdTemplate(), test.name, test.options, target)
-  r.addResult(test, target, "", given.msg, given.err)
-  if given.err == reSuccess: inc(r.passed)
-
-proc testC(r: var TResults, test: TTest) =
+proc testC(r: var TResults, test: TTest, action: TTestAction) =
   # runs C code. Doesn't support any specs, just goes by exit code.
   let tname = test.name.addFileExt(".c")
   inc(r.total)
@@ -422,27 +508,41 @@ proc testExec(r: var TResults, test: TTest) =
   if given.err == reSuccess: inc(r.passed)
   r.addResult(test, targetC, "", given.msg, given.err)
 
-proc makeTest(test, options: string, cat: Category, action = actionCompile,
-              env: string = ""): TTest =
-  # start with 'actionCompile', will be overwritten in the spec:
-  result = TTest(cat: cat, name: test, options: options,
-                 action: action, startTime: epochTime())
+proc makeTest(test, options: string, cat: Category): TTest =
+  result.cat = cat
+  result.name = test
+  result.options = options
+  result.spec = parseSpec(addFileExt(test, ".nim"))
+  result.startTime = epochTime()
+
+# TODO: fix these files
+const disabledFilesDefault = @[
+  "LockFreeHash.nim",
+  "sharedstrings.nim",
+  "tableimpl.nim",
+  "setimpl.nim",
+  "hashcommon.nim",
+
+  # Error: undeclared identifier: 'hasThreadSupport'
+  "ioselectors_epoll.nim",
+  "ioselectors_kqueue.nim",
+  "ioselectors_poll.nim",
+
+  # Error: undeclared identifier: 'Timeval'
+  "ioselectors_select.nim",
+]
 
 when defined(windows):
   const
     # array of modules disabled from compilation test of stdlib.
-    disabledFiles = ["coro.nim", "fsmonitor.nim"]
+    disabledFiles = disabledFilesDefault & @["coro.nim"]
 else:
   const
     # array of modules disabled from compilation test of stdlib.
-    disabledFiles = ["-"]
+    # TODO: why the ["-"]? (previous code should've prob used seq[string] = @[] instead)
+    disabledFiles = disabledFilesDefault & @["-"]
 
 include categories
-
-# proc runCaasTests(r: var TResults) =
-#   for test, output, status, mode in caasTestsRunner():
-#     r.addResult(test, "", output & "-> " & $mode,
-#                 if status: reSuccess else: reOutputsDiffer)
 
 proc main() =
   os.putenv "NIMTEST_COLOR", "never"
@@ -451,54 +551,112 @@ proc main() =
   backend.open()
   var optPrintResults = false
   var optFailing = false
-
   var targetsStr = ""
+  var isMainProcess = true
+  var skipFrom = ""
 
   var p = initOptParser()
   p.next()
   while p.kind == cmdLongoption:
     case p.key.string.normalize
     of "print", "verbose": optPrintResults = true
+    of "verbosemegatest": verboseMegatest = true
+    of "verbosecommands": verboseCommands = true
     of "failing": optFailing = true
     of "pedantic": discard "now always enabled"
     of "targets":
       targetsStr = p.val.string
-      targets = parseTargets(targetsStr)
-    of "nim": compilerPrefix = p.val.string
-    else: quit Usage
+      gTargets = parseTargets(targetsStr)
+    of "nim":
+      compilerPrefix = addFileExt(p.val.string, ExeExt)
+    of "directory":
+      setCurrentDir(p.val.string)
+    of "colors":
+      case p.val.string:
+      of "on":
+        useColors = true
+      of "off":
+        useColors = false
+      else:
+        quit Usage
+    of "simulate":
+      simulate = true
+    of "backendlogging":
+      case p.val.string:
+      of "on":
+        backendLogging = true
+      of "off":
+        backendLogging = false
+      else:
+        quit Usage
+    of "skipfrom":
+      skipFrom = p.val.string
+    else:
+      quit Usage
     p.next()
-  if p.kind != cmdArgument: quit Usage
+  if p.kind != cmdArgument:
+    quit Usage
   var action = p.key.string.normalize
   p.next()
   var r = initResults()
   case action
   of "all":
-    let testsDir = "tests" & DirSep
-    var myself = quoteShell(findExe("testament" / "tester"))
-    if targetsStr.len > 0:
-      myself &= " " & quoteShell("--targets:" & targetsStr)
+    if getEnv("NIM_TEST_PACKAGES", "false").string == "true":
+      # ugly hack to keep things relatively simple
+      processCategory(r, Category"nimble-packages", "", "", "", false)
+    else:
+      #processCategory(r, Category"megatest", p.cmdLineRest.string, testsDir, runJoinableTests = false)
 
-    myself &= " " & quoteShell("--nim:" & compilerPrefix)
+      var myself = quoteShell(findExe("testament" / "tester"))
+      if targetsStr.len > 0:
+        myself &= " " & quoteShell("--targets:" & targetsStr)
 
-    var cmds: seq[string] = @[]
-    let rest = if p.cmdLineRest.string.len > 0: " " & p.cmdLineRest.string else: ""
-    for kind, dir in walkDir(testsDir):
-      assert testsDir.startsWith(testsDir)
-      let cat = dir[testsDir.len .. ^1]
-      if kind == pcDir and cat notin ["testdata", "nimcache"]:
-        cmds.add(myself & " cat " & quoteShell(cat) & rest)
-    for cat in AdditionalCategories:
-      cmds.add(myself & " cat " & quoteShell(cat) & rest)
-    quit osproc.execProcesses(cmds, {poEchoCmd, poStdErrToStdOut, poUsePath, poParentStreams})
+      myself &= " " & quoteShell("--nim:" & compilerPrefix)
+
+      if skipFrom.len > 0:
+        myself &= " " & quoteShell("--skipFrom:" & skipFrom)
+
+      var cats: seq[string]
+      let rest = if p.cmdLineRest.string.len > 0: " " & p.cmdLineRest.string else: ""
+      for kind, dir in walkDir(testsDir):
+        assert testsDir.startsWith(testsDir)
+        let cat = dir[testsDir.len .. ^1]
+        if kind == pcDir and cat notin ["testdata", "nimcache"]:
+          cats.add cat
+      cats.add AdditionalCategories
+
+      var cmds: seq[string]
+      for cat in cats:
+        cmds.add(myself & " pcat " & quoteShell(cat) & rest)
+
+      proc progressStatus(idx: int) =
+        echo "progress[all]: i: " & $idx & " / " & $cats.len & " cat: " & cats[idx]
+
+      if simulate:
+        for i, cati in cats:
+          progressStatus(i)
+          processCategory(r, Category(cati), p.cmdLineRest.string, testsDir, skipFrom, runJoinableTests = false)
+      else:
+        quit osproc.execProcesses(cmds, {poEchoCmd, poStdErrToStdOut, poUsePath, poParentStreams}, beforeRunEvent = progressStatus)
   of "c", "cat", "category":
     var cat = Category(p.key)
     p.next
-    processCategory(r, cat, p.cmdLineRest.string)
+    processCategory(r, cat, p.cmdLineRest.string, testsDir, skipFrom, runJoinableTests = true)
+  of "pcat":
+    # 'pcat' is used for running a category in parallel. Currently the only
+    # difference is that we don't want to run joinable tests here as they
+    # are covered by the 'megatest' category.
+    isMainProcess = false
+    var cat = Category(p.key)
+    p.next
+    processCategory(r, cat, p.cmdLineRest.string, testsDir, skipFrom, runJoinableTests = false)
   of "r", "run":
-    let (dir, file) = splitPath(p.key.string)
-    let (_, subdir) = splitPath(dir)
-    var cat = Category(subdir)
-    processSingleTest(r, cat, p.cmdLineRest.string, file)
+    # at least one directory is required in the path, to use as a category name
+    let pathParts = split(p.key.string, {DirSep, AltSep})
+    # "stdlib/nre/captures.nim" -> "stdlib" + "nre/captures.nim"
+    let cat = Category(pathParts[0])
+    let subPath = joinPath(pathParts[1..^1])
+    processSingleTest(r, cat, p.cmdLineRest.string, subPath)
   of "html":
     generateHtml(resultsFile, optFailing)
   else:
@@ -513,6 +671,8 @@ proc main() =
     echo "FAILURE! total: ", r.total, " passed: ", r.passed, " skipped: ",
       r.skipped, " failed: ", failed
     quit(QuitFailure)
+  if isMainProcess:
+    echo "Used ", compilerPrefix, " to run the tests. Use --nim to override."
 
 if paramCount() == 0:
   quit Usage

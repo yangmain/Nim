@@ -10,20 +10,21 @@
 import parseutils, strutils, os, osproc, streams, parsecfg
 
 
-var compilerPrefix* = "compiler" / "nim "
+var compilerPrefix* = "compiler" / "nim"
 
 let isTravis* = existsEnv("TRAVIS")
 let isAppVeyor* = existsEnv("APPVEYOR")
 
 proc cmdTemplate*(): string =
-  compilerPrefix & "$target --lib:lib --hints:on -d:testing --nimblePath:tests/deps $options $file"
+  compilerPrefix & " $target --hints:on -d:testing --nimblePath:tests/deps $options $file"
 
 type
   TTestAction* = enum
-    actionCompile = "compile"
     actionRun = "run"
+    actionCompile = "compile"
     actionReject = "reject"
     actionRunNoSpec = "runNoSpec"
+
   TResultEnum* = enum
     reNimcCrash,     # nim compiler seems to have crashed
     reMsgsDiffer,       # error messages differ
@@ -38,7 +39,10 @@ type
     reInstallFailed     # package installation failed
     reBuildFailed       # package building failed
     reIgnored,          # test is ignored
+    reJoined
     reSuccess           # test was successful
+    reInvalidSpec
+
   TTarget* = enum
     targetC = "C"
     targetCpp = "C++"
@@ -48,6 +52,7 @@ type
   TSpec* = object
     action*: TTestAction
     file*, cmd*: string
+    input*: string
     outp*: string
     line*, column*: int
     tfile*: string
@@ -59,6 +64,7 @@ type
     err*: TResultEnum
     substr*, sortoutput*: bool
     targets*: set[TTarget]
+    parseErrors*:  string
     nimout*: string
 
 const
@@ -144,6 +150,8 @@ proc parseSpec*(filename: string): TSpec =
     of "output":
       result.action = actionRun
       result.outp = e.value
+    of "input":
+      result.input = e.value
     of "outputsub":
       result.action = actionRun
       result.outp = e.value
@@ -186,7 +194,7 @@ proc parseSpec*(filename: string): TSpec =
         raise newException(ValueError, "cannot interpret as a bool: " & e.value)
     of "cmd":
       if e.value.startsWith("nim "):
-        result.cmd = compilerPrefix & e.value[4..^1]
+        result.cmd = compilerPrefix & e.value[3..^1]
       else:
         result.cmd = e.value
     of "ccodecheck": result.ccodeCheck = e.value
